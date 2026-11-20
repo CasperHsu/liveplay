@@ -1364,10 +1364,13 @@ function startAPIServer(port = 8080, maxAttempts = 10) {
 
   // Try to start server, incrementing port if already in use
   const tryListen = (currentPort, attemptsLeft) => {
-    const server = apiApp.listen(currentPort)
+    // 2026-11 security audit LP-04: this API has no authentication and changes show
+    // state via GET, so it only listens on loopback. Set LIVEPLAY_API_HOST=0.0.0.0
+    // to expose it to the network deliberately (e.g. a trusted show-control box).
+    const server = apiApp.listen(currentPort, process.env.LIVEPLAY_API_HOST || '127.0.0.1')
       .on('listening', () => {
         apiServer = server;
-        console.log(`LivePlay API Server running on http://localhost:${currentPort}`);
+        console.log(`LivePlay API Server running on http://${process.env.LIVEPLAY_API_HOST || '127.0.0.1'}:${currentPort}`);
       })
       .on('error', (err) => {
         if (err.code === 'EADDRINUSE' && attemptsLeft > 0) {
@@ -2297,7 +2300,17 @@ ipcMain.handle('ensure-directory', async (event, dirPath) => {
 
 ipcMain.handle('open-folder', async (event, folderPath) => {
   try {
-    shell.openPath(folderPath);
+    // 2026-11 security audit LP-06: folderPath can come from the server's project
+    // document. shell.openPath runs executables and a UNC path makes Windows
+    // connect to a remote share, so only open an existing local directory.
+    if (typeof folderPath !== 'string' || !folderPath || /^(\\\\|\/\/)/.test(folderPath)) {
+      return { success: false, error: 'Not a local folder' };
+    }
+    if (!fs.existsSync(folderPath) || !fs.statSync(folderPath).isDirectory()) {
+      return { success: false, error: 'Folder not found' };
+    }
+    const err = await shell.openPath(folderPath);
+    if (err) return { success: false, error: err };
     return { success: true };
   } catch (error) {
     return { success: false, error: error.message };
