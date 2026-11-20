@@ -123,7 +123,9 @@ A single-machine install talks to itself over `127.0.0.1` and needs nothing open
 | `4480` | TCP | Control surface — REST API + WebSocket (transport, project data, routing, live meters). |
 | `4481` | UDP | LAN auto-discovery beacon (broadcast + multicast group `239.255.69.80`). Lets clients find servers without typing an IP. |
 
-On Windows the NSIS installer adds the necessary inbound firewall rules at install time; the app also makes a best-effort runtime pass if run elevated. On macOS/Linux, allow the `liveplay-server` binary through your firewall if you operate it remotely.
+On Windows the NSIS installer adds the necessary inbound firewall rules at install time — for the server they apply to **Domain/Private networks only**, so set a trusted show LAN to Private (on a Public network the server is unreachable from other machines); the app also makes a best-effort runtime pass if run elevated. On macOS/Linux, allow the `liveplay-server` binary through your firewall if you operate it remotely.
+
+> **Security note:** the control port has no authentication yet. Anyone who can reach `4480` can browse and write files as the user running the server and control playback. In Local mode the desktop client therefore starts the server bound to `127.0.0.1`; only run the standalone `LivePlay Server` (bound to all interfaces) on a network you trust.
 
 ## Repository layout
 
