@@ -690,6 +690,11 @@ void AudioEngine::route_item_source_to_mixer(const CueId& cue,
     auto it = items_.find(cue.value);
     if (it == items_.end()) return;
     if (mixers_.find(mixer.value) == mixers_.end()) return;
+    // source_channel comes straight from the control API. Reject anything the
+    // cue doesn't actually have: besides being meaningless, UINT32_MAX would
+    // make `source_channel + 1` wrap to 0, shrink the vector to nothing and
+    // then index past its end below.
+    if (source_channel >= it->second->source_channel_count()) return;
 
     auto& routes = pending_.item_sources[cue.value].by_source_channel;
     if (source_channel >= routes.size()) routes.resize(source_channel + 1);
