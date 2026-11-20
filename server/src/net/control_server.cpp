@@ -35,6 +35,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -63,10 +64,113 @@ namespace liveplay::net {
 static nlohmann::json build_playback_snapshot(audio::AudioEngine& engine,
                                               core::ProjectState& state);
 
+// ---------------------------------------------------------------------------
+// Browser origin guard (2026-11 security audit LP-02)
+//
+// The control API has no authentication, so it must not be callable from an
+// arbitrary web page the operator happens to have open (classic cross-site
+// request, or a DNS-rebinding page that resolves its own name to 127.0.0.1).
+// Legitimate callers are the Electron client (renderer loaded from file:// or
+// data:, Origin "null"; the dev build on http://localhost:3000) and
+// non-browser tools that send no Origin at all.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string lower_copy(std::string_view v) {
+    std::string out{v};
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return out;
+}
+
+// "host:port" / "[v6]:port" / "host" -> host (lower-case, brackets kept for v6).
+std::string host_without_port(std::string_view hostport) {
+    std::string h = lower_copy(hostport);
+    if (!h.empty() && h.front() == '[') {
+        const auto close = h.find(']');
+        return close == std::string::npos ? h : h.substr(0, close + 1);
+    }
+    const auto colon = h.rfind(':');
+    if (colon != std::string::npos && h.find(':') == colon) h = h.substr(0, colon);
+    return h;
+}
+
+bool is_ipv4_literal(const std::string& h) {
+    if (h.empty()) return false;
+    int dots = 0;
+    for (char c : h) {
+        if (c == '.') ++dots;
+        else if (c < '0' || c > '9') return false;
+    }
+    return dots == 3;
+}
+
+bool is_loopback_or_private_ipv4(const std::string& h) {
+    if (!is_ipv4_literal(h)) return false;
+    int a = 0, b = 0;
+    if (std::sscanf(h.c_str(), "%d.%d", &a, &b) != 2) return false;
+    return a == 127 || a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168);
+}
+
+// Origins a browser-based caller is allowed to have.
+bool origin_allowed(const std::string& origin_raw) {
+    if (origin_raw.empty()) return true;                       // not a browser request
+    const std::string origin = lower_copy(origin_raw);
+    if (origin == "null" || origin == "file://") return true;  // Electron renderer (file:// / data:)
+    const auto sep = origin.find("://");
+    if (sep == std::string::npos) return false;
+    const std::string scheme = origin.substr(0, sep);
+    if (scheme == "app") return true;
+    if (scheme != "http" && scheme != "https") return false;
+    const std::string host = host_without_port(origin.substr(sep + 3));
+    return host == "localhost" || host == "[::1]" || is_loopback_or_private_ipv4(host);
+}
+
+// Host header check against DNS rebinding: a public DNS name pointing at this
+// machine is never how the client reaches the server (it uses an IP address,
+// localhost, a single-label name or a .local mDNS name).
+bool host_header_allowed(const std::string& host_header) {
+    if (host_header.empty()) return true;
+    const std::string host = host_without_port(host_header);
+    if (host.empty() || host.front() == '[' || is_ipv4_literal(host)) return true;
+    if (host.find('.') == std::string::npos) return true;      // "localhost", "STAGE-PC"
+    for (const char* suffix : {".local", ".lan", ".home.arpa", ".internal", ".localdomain"}) {
+        const std::string_view sv{suffix};
+        if (host.size() > sv.size() && host.compare(host.size() - sv.size(), sv.size(), sv) == 0) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+// Global Crow middleware: runs before every route, including the /ws upgrade.
+struct BrowserOriginGuard {
+    struct context {};
+
+    void before_handle(crow::request& req, crow::response& res, context&) {
+        const std::string origin = req.get_header_value("Origin");
+        const std::string host   = req.get_header_value("Host");
+        if (origin_allowed(origin) && host_header_allowed(host)) return;
+        Logger::warn("Rejected request {} from origin '{}' (host '{}')", req.url, origin, host);
+        res.code = 403;
+        res.set_header("Content-Type", "application/json");
+        res.body = R"({"error":"origin not allowed"})";
+        res.end();
+    }
+
+    // Replace the permissive "*" with the caller's own (already allowed) origin.
+    void after_handle(crow::request& req, crow::response& res, context&) {
+        const std::string origin = req.get_header_value("Origin");
+        if (origin.empty()) return;
+        res.set_header("Access-Control-Allow-Origin", origin);
+        res.add_header("Vary", "Origin");
+    }
+};
+
 // Pimpl: all Crow + WebSocket state lives here so crow.h stays out of the
 // public header.
 struct ControlServer::Impl {
-    crow::SimpleApp app;
+    crow::App<BrowserOriginGuard> app;
     std::thread     app_thread;
     std::thread     broadcast_thread;
     std::mutex      ws_mutex;
@@ -230,7 +334,23 @@ static bool zip_extract_to(const fs::path& src_zip, const fs::path& out_dir) {
             Logger::warn("zip_extract_to: skipping suspicious entry '{}'", name);
             continue;
         }
-        const fs::path dest = out_dir / liveplay::util::utf8_to_path(name);
+        // 2026-11 security audit LP-03: on Windows "C:/x" or "C:x" makes
+        // `out_dir / name` replace out_dir entirely, so refuse anything with a
+        // drive letter / root name (':' is not a valid file-name character on
+        // Windows anyway), and double-check the result stays inside out_dir.
+        const fs::path entry = liveplay::util::utf8_to_path(name);
+        if (name.find(':') != std::string::npos || entry.has_root_name() || entry.has_root_directory()) {
+            Logger::warn("zip_extract_to: skipping rooted entry '{}'", name);
+            continue;
+        }
+        const fs::path dest = out_dir / entry;
+        {
+            const fs::path rel = dest.lexically_normal().lexically_relative(out_dir.lexically_normal());
+            if (rel.empty() || rel.is_absolute() || *rel.begin() == "..") {
+                Logger::warn("zip_extract_to: skipping entry outside destination '{}'", name);
+                continue;
+            }
+        }
         if (mz_zip_reader_is_file_a_directory(&zip, i)) {
             fs::create_directories(dest, ec);
             continue;
