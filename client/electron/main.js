@@ -265,7 +265,9 @@ function ensureFirewallRules() {
   // Marker is versioned: bumping the suffix forces a one-time re-run so
   // existing installs that only got the old UDP-only pass pick up the new
   // server TCP rule.
-  const markerPath = path.join(app.getPath('userData'), '.firewall-configured-v2');
+  // v3: server rules are limited to the Domain/Private profiles and are
+  // replaced (delete + add) rather than duplicated.
+  const markerPath = path.join(app.getPath('userData'), '.firewall-configured-v3');
   try { if (fs.existsSync(markerPath)) return; } catch {}
 
   const exe = process.execPath;
@@ -276,27 +278,35 @@ function ensureFirewallRules() {
   //    LAN discovery (UDP) still finds the server but every actual connection
   //    is silently dropped, so the client appears to connect yet nothing works.
   //    The client never accepts inbound TCP, so it only needs UDP.
+  //
+  // The server's control port has no authentication, so its rules only apply
+  // on Domain/Private networks. On a network Windows classifies as Public
+  // (hotel / venue / café Wi-Fi) inbound connections to the server stay
+  // blocked; mark a trusted LAN as Private to operate a server remotely.
   const rules = [
-    ['LivePlay Client', exe,       ['UDP']],
-    ['LivePlay Server', serverExe, ['UDP', 'TCP']],
+    ['LivePlay Client', exe,       ['UDP'],        'any'],
+    ['LivePlay Server', serverExe, ['UDP', 'TCP'], 'domain,private'],
   ];
   let attempted = false;
-  for (const [name, program, protocols] of rules) {
+  for (const [name, program, protocols, profile] of rules) {
     if (!program || !fs.existsSync(program)) continue;
     attempted = true;
     for (const proto of protocols) {
       // Program-scoped inbound allow — covers discovery / control on all ports.
-      const cmd = `netsh advfirewall firewall add rule name="${name} (${proto}-In)" ` +
-                  `dir=in action=allow protocol=${proto} program="${program}" enable=yes profile=any`;
-      exec(cmd, (err) => {
+      // Delete first so an older rule (e.g. profile=any) is replaced, not kept alongside.
+      const ruleName = `${name} (${proto}-In)`;
+      const del = `netsh advfirewall firewall delete rule name="${ruleName}"`;
+      const cmd = `netsh advfirewall firewall add rule name="${ruleName}" ` +
+                  `dir=in action=allow protocol=${proto} program="${program}" enable=yes profile=${profile}`;
+      exec(del, () => exec(cmd, (err) => {
         if (err) {
           // Almost always "requires elevation" — expected for non-admin runs.
           console.warn('[liveplay-firewall] could not add', proto, 'rule for', name,
                        '(needs admin / handled by installer):', err.message);
         } else {
-          console.log('[liveplay-firewall] inbound', proto, 'rule ensured for', name);
+          console.log('[liveplay-firewall] inbound', proto, 'rule ensured for', name, 'profile', profile);
         }
-      });
+      }));
     }
   }
   // Write the marker regardless so we don't re-spawn netsh every launch; the
@@ -377,8 +387,15 @@ async function startLiveplayServer() {
   liveplayServerPort = cfg.localPort;
 
   console.log('[liveplay-server] launching (visible console)', exePath, 'on port', cfg.localPort);
+  // Local mode = single-machine install: the client always talks to
+  // 127.0.0.1, so the server must not listen on the LAN. Its control API has
+  // no authentication, and binding 0.0.0.0 (the server's default) would let
+  // anyone on the same network (e.g. venue Wi-Fi) read/write files and drive
+  // the show. Machines that should be controlled over the LAN run the
+  // standalone "LivePlay Server" shortcut instead.
   const serverArgs = [
     '--port',    String(cfg.localPort),
+    '--bind',    '127.0.0.1',
     '--pidfile', lockPath,
   ];
   try {

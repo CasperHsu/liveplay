@@ -12,11 +12,15 @@
   ; receiving beacons / unicast replies. Program-scoped rules cover all the
   ; ports we use (UDP/4481 discovery + TCP/4480 control). Delete any stale
   ; rules first so re-installs don't pile up duplicates.
+  ; The server's control port has no authentication, so its rules apply only
+  ; on Domain/Private networks: on Public networks (venue / hotel Wi-Fi) the
+  ; server cannot be reached from other machines. Mark a trusted LAN as
+  ; Private to run a stage-side server. (Local mode binds 127.0.0.1 anyway.)
   nsExec::Exec 'netsh advfirewall firewall delete rule name="LivePlay Server (UDP-In)"'
   nsExec::Exec 'netsh advfirewall firewall delete rule name="LivePlay Server (TCP-In)"'
   nsExec::Exec 'netsh advfirewall firewall delete rule name="LivePlay Client (UDP-In)"'
-  nsExec::Exec 'netsh advfirewall firewall add rule name="LivePlay Server (UDP-In)" dir=in action=allow protocol=UDP program="$INSTDIR\resources\server-bin\liveplay-server.exe" enable=yes profile=any'
-  nsExec::Exec 'netsh advfirewall firewall add rule name="LivePlay Server (TCP-In)" dir=in action=allow protocol=TCP program="$INSTDIR\resources\server-bin\liveplay-server.exe" enable=yes profile=any'
+  nsExec::Exec 'netsh advfirewall firewall add rule name="LivePlay Server (UDP-In)" dir=in action=allow protocol=UDP program="$INSTDIR\resources\server-bin\liveplay-server.exe" enable=yes profile=domain,private'
+  nsExec::Exec 'netsh advfirewall firewall add rule name="LivePlay Server (TCP-In)" dir=in action=allow protocol=TCP program="$INSTDIR\resources\server-bin\liveplay-server.exe" enable=yes profile=domain,private'
   nsExec::Exec 'netsh advfirewall firewall add rule name="LivePlay Client (UDP-In)" dir=in action=allow protocol=UDP program="$INSTDIR\${APP_EXECUTABLE_FILENAME}" enable=yes profile=any'
 !macroend
 
